@@ -13,3 +13,4 @@ notes/
 .DS_Store
 __pycache__/
 *.pyc
+data/fly_circuit_*_q8.npz
