@@ -37,13 +37,19 @@ def load_brain(args):
         brain = PlasticFlyCircuit(path=circuit_path, scope=ck.get("scope", "dn-exc"))
         brain.set_readout(ck.get("readout_kind", "all"))
         brain.set_plastic_weights(np.asarray(ck["plastic_weights"], dtype=np.float64))
+        if ck.get("homeo_target", 0) > 0:
+            brain.enable_homeostasis(target=float(ck["homeo_target"]))
         r = ck["readout"]
         readout = (np.asarray(r["mu"], np.float32), np.asarray(r["sd"], np.float32),
                    np.asarray(r["W"], np.float32))
-        gain = float(ck.get("gain", 80.0))
+        if "gain_odor" in ck:
+            gains = (float(ck["gain_odor"]), float(ck["gain_loom"]))
+        else:
+            gains = (float(ck.get("gain", 80.0)),) * 2
         print(f"loaded checkpoint {args.checkpoint} "
-              f"(circuit {os.path.basename(circuit_path)})")
-        return brain, gain, readout
+              f"(circuit {os.path.basename(circuit_path)}, "
+              f"odor x{gains[0]:g} loom x{gains[1]:g})")
+        return brain, gains, readout
     brain = FlyCircuit(args.circuit)
     brain.set_readout(args.readout)
     probe = World(8, args.max_steps, seed=100 + args.seed)
@@ -51,7 +57,7 @@ def load_brain(args):
     stream = demo_stream(probe, eparams, 3)
     gain, readout, mse, _ = fit_with_gain(brain, stream)
     print(f"fresh readout on rover demos: gain x{gain:g}, clone-MSE {mse:.4f}")
-    return brain, gain, readout
+    return brain, (gain, gain), readout
 
 
 def arm_demos(episodes=8, max_steps=400, seed=100):
@@ -84,7 +90,8 @@ def fit_body_readout(brain, body_name, max_steps, seed):
     return gain, readout
 
 
-def run_body(brain, gain, readout, body_name, episodes, max_steps, seed):
+def run_body(brain, gains, readout, body_name, episodes, max_steps, seed):
+    go, gl = (gains if isinstance(gains, (tuple, list)) else (gains, gains))
     mu, sd, W = readout
     cls = BODIES[body_name]
     n_ok, n_crash, prog, total_r = 0, 0, [], 0.0
@@ -95,7 +102,7 @@ def run_body(brain, gain, readout, body_name, episodes, max_steps, seed):
         done = False
         while not done:
             ext = brain.sensor_current(
-                gain, gain, np.array([ol]), np.array([orr]),
+                go, gl, np.array([ol]), np.array([orr]),
                 np.array([ll]), np.array([lr]))
             for _ in range(BRAIN_STEPS):
                 brain.step(ext)
@@ -133,14 +140,14 @@ def main():
         if b.strip() not in BODIES:
             sys.exit(f"unknown body '{b.strip()}', choose from {sorted(BODIES)}")
 
-    brain, gain, readout = load_brain(args)
+    brain, gains, readout = load_brain(args)
     rows = []
     for body_name in args.bodies.split(","):
         body_name = body_name.strip()
         if not body_name:
             continue
         g, r = (fit_body_readout(brain, body_name, args.max_steps, 100 + args.seed)
-                if args.fit_body and not args.checkpoint else (gain, readout))
+                if args.fit_body and not args.checkpoint else (gains, readout))
         row = run_body(brain, g, r, body_name,
                        args.episodes, args.max_steps, args.seed)
         rows.append(row)

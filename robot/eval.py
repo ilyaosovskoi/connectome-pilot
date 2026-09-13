@@ -63,10 +63,13 @@ GAIN_GRID = (10.0, 20.0, 40.0, 80.0)   # сетка калибровки вхо�
 class World:
     """Векторизованный мир: сразу M эпизодов, чтобы прогоны шли пачками."""
 
-    def __init__(self, episodes: int, max_steps: int, seed: int = 0):
+    def __init__(self, episodes: int, max_steps: int, seed: int = 0,
+                 heading_noise: float = 0.0):
         rng = np.random.default_rng(seed)
         self.m = episodes
         self.max_steps = max_steps
+        self.heading_noise = float(heading_noise)
+        self._rng = np.random.default_rng(seed + 999)
         self.start = rng.uniform(2.0, ARENA - 2.0, size=(episodes, 2))
         self.goal = rng.uniform(3.0, ARENA - 3.0, size=(episodes, 2))
         far = np.linalg.norm(self.start - self.goal, axis=1) < 8.0
@@ -93,6 +96,9 @@ class World:
     def reset(self):
         self.p = self.start.copy()
         self.th = np.arctan2(self.goal[:, 1] - self.p[:, 1], self.goal[:, 0] - self.p[:, 0])
+        if self.heading_noise > 0:
+            self.th = self.th + self._rng.uniform(-self.heading_noise,
+                                                  self.heading_noise, size=self.m)
         self.steps = np.zeros(self.m, dtype=np.int64)
         self.success = np.zeros(self.m, dtype=bool)
         self.crash = np.zeros(self.m, dtype=bool)

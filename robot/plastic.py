@@ -68,6 +68,14 @@ class PlasticFlyCircuit(FlyCircuit):
             mask = np.array([self.sign[p] > 0 for p in self.edge_pre])
         self.plastic_mask = mask
         self.plastic_idx = np.nonzero(mask)[0].astype(np.int64)
+        # Scale-aware plasticity: raw FlyWire counts span ~3..1500 synapses,
+        # so absolute steps/clips would erase the strongest pathways.
+        # Each weight moves proportionally to its own initial value and is
+        # clipped to [0.2x, 5x] of it.
+        self.w_init = np.array(
+            [self._raw_lookup.get((int(self.edge_pre[i]), int(self.edge_post[i])), 1.0)
+             for i in self.plastic_idx], dtype=np.float64)
+        self.w_init[self.w_init <= 0] = 1.0
         # Eligibility trace per plastic edge.
         self.elig = np.zeros(len(self.plastic_idx), dtype=np.float32)
         # Map plastic position -> position in CSR data array.
@@ -124,17 +132,30 @@ class PlasticFlyCircuit(FlyCircuit):
     def reset_trace(self):
         self.elig.fill(0.0)
 
-    def observe(self, pre_spikes: np.ndarray, post_rate: np.ndarray):
-        """Accumulate eligibility from one control step (batch dim collapsed by mean)."""
+    def observe(self, pre_spikes: np.ndarray, post_rate: np.ndarray,
+                post_spikes: np.ndarray | None = None):
+        """Accumulate eligibility from one control step (batch dim collapsed by mean).
+
+        Classic R-STDP mix: a spike-spike term (recruits quiet neurons) plus a
+        small rate term (refines active ones). Pure rate gating freezes silent
+        postsynaptic cells forever — verified failure mode on turn DNs.
+        """
         pre = np.asarray(pre_spikes, dtype=np.float32)
         if pre.ndim == 2:
             pre = pre.mean(axis=0)
         post = np.asarray(post_rate, dtype=np.float32)
         if post.ndim == 2:
             post = post.mean(axis=0)
+        if post_spikes is None:
+            post_spikes = (post > 0).astype(np.float32)
+        else:
+            post_spikes = np.asarray(post_spikes, dtype=np.float32)
+            if post_spikes.ndim == 2:
+                post_spikes = post_spikes.mean(axis=0)
         pe = pre[self.edge_pre[self.plastic_idx]]
-        po = post[self.edge_post[self.plastic_idx]]
-        self.elig = self.decay * self.elig + (po * pe).astype(np.float32)
+        po_rate = post[self.edge_post[self.plastic_idx]]
+        po_spk = post_spikes[self.edge_post[self.plastic_idx]]
+        self.elig = self.decay * self.elig + (pe * (po_spk + 0.05 * po_rate)).astype(np.float32)
 
     def _refresh_matrix(self):
         """Recompute normalized signed CSR values from raw weights."""
@@ -157,19 +178,45 @@ class PlasticFlyCircuit(FlyCircuit):
         self._csr.data = new_data
         self.B = self._csr
 
+    def apply_episodic(self, ret: float) -> float:
+        """One REINFORCE-style update at episode end.
+
+        Eligibility accumulated over the whole episode (see observe()) is
+        normalized so the most-coactive synapse takes the full step; the step
+        is a bounded fraction of each weight's own initial value. This fits
+        slow robots: 700 sparse control steps build one dense co-activity
+        picture, then a single return judges it.
+        """
+        rpe = float(ret) - self.V_baseline
+        self.V_baseline += 0.2 * rpe
+        if self.n_plastic == 0:
+            return rpe
+        norm = float(np.abs(self.elig).max()) or 1.0
+        step = (self.lr * np.tanh(rpe / 2.0)
+                * (self.elig / norm) * self.w_init * 0.2)
+        for k, ei in enumerate(self.plastic_idx):
+            key = (int(self.edge_pre[ei]), int(self.edge_post[ei]))
+            lo, hi = 0.2 * self.w_init[k], 5.0 * self.w_init[k]
+            cur = self._raw_lookup.get(key, 1.0) + float(step[k])
+            self._raw_lookup[key] = min(max(cur, lo), hi)
+        self._refresh_matrix()
+        self.elig.fill(0.0)
+        return rpe
+
     def apply_reward(self, reward: float) -> float:
-        """Dopamine-style update. Returns RPE used."""
+        """Per-step dopamine update (same math, smaller step). Noisy on slow
+        robots — prefer apply_episodic() there. Kept for fine-timescale tasks."""
         rpe = float(reward) - self.V_baseline
         self.V_baseline += 0.05 * rpe  # slow critic
         if abs(rpe) < 1e-6 or self.n_plastic == 0:
             return rpe
-        dw = self.lr * rpe * self.elig
-        # Update raw weights, then refresh normalized CSR entries.
+        step = (self.lr * np.tanh(rpe / 2.0)
+                * np.clip(self.elig, -3.0, 3.0) * self.w_init * 0.02)
         for k, ei in enumerate(self.plastic_idx):
             key = (int(self.edge_pre[ei]), int(self.edge_post[ei]))
-            cur = self._raw_lookup.get(key, 1.0) + float(dw[k])
-            cur = min(max(cur, self.w_min), self.w_max)
-            self._raw_lookup[key] = cur
+            lo, hi = 0.2 * self.w_init[k], 5.0 * self.w_init[k]
+            cur = self._raw_lookup.get(key, 1.0) + float(step[k])
+            self._raw_lookup[key] = min(max(cur, lo), hi)
         self._refresh_matrix()
         # Decay trace after consuming (standard R-STDP).
         self.elig *= 0.5
@@ -187,6 +234,7 @@ class PlasticFlyCircuit(FlyCircuit):
         assert len(w) == self.n_plastic
         for k, ei in enumerate(self.plastic_idx):
             key = (int(self.edge_pre[ei]), int(self.edge_post[ei]))
-            self._raw_lookup[key] = float(min(max(w[k], self.w_min), self.w_max))
+            lo, hi = 0.2 * self.w_init[k], 5.0 * self.w_init[k]
+            self._raw_lookup[key] = float(min(max(w[k], lo), hi))
         self._refresh_matrix()
         self.elig.fill(0.0)

@@ -1,8 +1,12 @@
-# Полный коннектом FlyWire — качается скриптом, в git не нужен (~127 МБ).
+# Full FlyWire connectome — fetched by script, not for git (~127 MB).
 # python3 scripts/download_full.py
 data/*.parquet
 data/*.tsv
 data/*.part
+
+# Local agent reports (session context, not for push).
+# See notes/HANDOFF.md.
+notes/
 
 .DS_Store
 __pycache__/

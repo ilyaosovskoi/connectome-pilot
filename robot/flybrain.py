@@ -131,7 +131,21 @@ class FlyCircuit:
         self.Isyn = np.zeros((m, self.n), dtype=np.float32)
         self.spikes = np.zeros((m, self.n), dtype=np.float32)
         self.rate = np.zeros((m, self.n), dtype=np.float32)
+        self.bias = np.zeros(self.n, dtype=np.float32)
         self.t_ms = 0.0
+        # NOTE: homeostasis config survives reset (bias itself restarts at 0).
+        self.homeo = getattr(self, "homeo", None)
+
+    def enable_homeostasis(self, target: float = 5.0, eta: float = 0.05,
+                           max_bias: float = 10.0) -> None:
+        """Homeostatic excitability: neurons drift toward a target firing rate.
+
+        Silent cells (e.g. turn DNs that never reach threshold) slowly gain
+        bias current; overactive cells lose it. Real neurons do this; here it
+        keeps every pathway recruitable for plasticity instead of frozen-silent.
+        """
+        self.homeo = {"target": float(target), "eta": float(eta),
+                      "max_bias": float(max_bias)}
 
     def sensor_current(self, g_odor: float, g_loom: float,
                        odor_l, odor_r, loom_l, loom_r) -> np.ndarray:
@@ -154,6 +168,8 @@ class FlyCircuit:
     def step(self, ext: np.ndarray) -> None:
         """Один LIF-шаг (dt мс) для всего батча. ext — внешний ток (m × n)."""
         dt = self.dt
+        if self.homeo is not None:
+            ext = ext + self.bias[None, :].astype(np.float32)
         # синаптический драйв = доля входа клетки, пришедшая за такт (n × m → m × n)
         drive = (self.B @ self.spikes.T).T
         self.Isyn = self.Isyn * np.exp(-dt / TAU_SYN) + drive
@@ -168,6 +184,11 @@ class FlyCircuit:
         self.spikes = fired.astype(np.float32)
         self.rate *= np.exp(-dt / TAU_RATE)
         self.rate += self.spikes * (dt / TAU_RATE) * (1000.0 / dt)   # масштаб ~Гц
+        if self.homeo is not None:
+            err = self.homeo["target"] - self.rate.mean(axis=0)
+            self.bias = np.clip(self.bias + self.homeo["eta"] * err,
+                                -self.homeo["max_bias"],
+                                self.homeo["max_bias"]).astype(np.float32)
         self.t_ms += dt
 
     # ── выход на колёса ──
