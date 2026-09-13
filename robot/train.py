@@ -36,6 +36,7 @@ from eval import (  # noqa: E402
     tune_expert,
 )
 from plastic import PlasticFlyCircuit  # noqa: E402
+from novelty import NoveltyBonus  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -117,8 +118,16 @@ def select_gains(circuit, stream, val, max_steps, grid=None):
 
 def rollout_plastic(circuit, world, gains, readout, max_steps, train: bool,
                     crash_coef: float = 0.5, imitate_coef: float = 0.0,
-                    eparams=None, episodic: bool = True):
-    """Single-episode loop. Returns (result, episodic return).
+                    eparams=None, episodic: bool = True,
+                    novelty=None, novelty_coef: float = 0.0):
+    """Single-episode loop. Returns (result, episodic return, parts).
+
+    Reward channels (logged separately, learned jointly):
+      task    — progress + hazard shaping + teacher imitation + terminal
+                bonus. This is "what is right" (PAM) and "what is wrong" (PPL1).
+      novelty — 1/sqrt(visits) for the sensor state. Curiosity only; it can
+                never outshout the task because the critic (V_baseline)
+                adapts to its mean and only deviations teach.
 
     episodic=True (default): accumulate eligibility all episode, ONE
     REINFORCE-style update at the end (see PlasticFlyCircuit.apply_episodic).
@@ -135,7 +144,7 @@ def rollout_plastic(circuit, world, gains, readout, max_steps, train: bool,
     world.reset()
     prev_d = np.linalg.norm(world.p - world.goal, axis=1)
     d0 = np.maximum(prev_d, 1e-6)
-    ep_ret = 0.0
+    ep_task, ep_novel = 0.0, 0.0
     for _ in range(max_steps):
         ol, orr, ll, lr = world.sensors()
         ext = circuit.sensor_current(go, gl, ol, orr, ll, lr)
@@ -147,33 +156,42 @@ def rollout_plastic(circuit, world, gains, readout, max_steps, train: bool,
         left, right = np.clip(cmd[:, 0], -1, 1), np.clip(cmd[:, 1], -1, 1)
         world.step(left, right)
         d = np.linalg.norm(world.p - world.goal, axis=1)
-        # Progress + hazard shaping: approaching goal is good, sitting in
-        # high-loom (near obstacle) is bad — the loom pathway finally gets signal.
+        # TASK channel: progress + hazard shaping + teacher imitation.
         loom = np.stack([np.asarray(ll), np.asarray(lr)], 1).mean()
-        r = ((prev_d - d) / d0).astype(np.float64) - crash_coef * float(loom) / 100.0
+        r_task = ((prev_d - d) / d0).astype(np.float64) - crash_coef * float(loom) / 100.0
         if imitate_coef > 0 and eparams is not None:
             el, er = expert_wheels(ol, orr, ll, lr, *eparams)
             imit = 1.0 - (np.abs(left - el) + np.abs(right - er)) / 4.0
-            r = r + imitate_coef * imit
+            r_task = r_task + imitate_coef * imit
+        # NOVELTY channel: curiosity about unvisited sensor states.
+        r_novel = 0.0
+        if novelty is not None and novelty_coef > 0 and world.m == 1:
+            r_novel = novelty.bonus(ol[0], orr[0], ll[0], lr[0])
         prev_d = d
         if train:
             circuit.observe(circuit.spikes, circuit.rate, circuit.spikes)
             if not episodic:
-                circuit.apply_reward(float(r.mean()) * REWARD_SCALE)
-            ep_ret += float(r.mean())
+                circuit.apply_reward((float(r_task.mean())
+                                      + novelty_coef * r_novel) * REWARD_SCALE)
+            ep_task += float(r_task.mean())
+            ep_novel += r_novel
         if bool(world.done.all()):
             break
     res = world.result()
     if episodic:
         circuit.decay = saved_decay
+    rpe = 0.0
     if train:
         bonus = 1.0 if bool(world.success.all()) else (
             -1.0 if bool(world.crash.all()) else 0.0)
+        total = (ep_task + novelty_coef * ep_novel) * REWARD_SCALE + bonus * REWARD_SCALE
         if episodic:
-            circuit.apply_episodic(ep_ret * REWARD_SCALE + bonus * REWARD_SCALE)
+            rpe = circuit.apply_episodic(total)
         else:
-            circuit.apply_reward(bonus * REWARD_SCALE)
-    return res, ep_ret
+            rpe = circuit.apply_reward(total)
+    parts = {"task": ep_task, "novelty": ep_novel,
+             "pam": max(rpe, 0.0), "ppl": max(-rpe, 0.0)}
+    return res, ep_task + novelty_coef * ep_novel, parts
 
 
 def label_stream(extra, eparams):
@@ -182,6 +200,36 @@ def label_stream(extra, eparams):
         left, right = expert_wheels(ol, orr, ll, lr, *eparams)
         out.append((ol, orr, ll, lr, left, right))
     return out
+
+
+def report_synapses(brain, top: int = 5):
+    """Proof that conductance changed: most strengthened/weakened synapses.
+
+    Prints pre-type -> post-type, raw count before -> after (x factor).
+    Raw count / postsynaptic input sum IS the effective conductance, so a
+    factor here is a conductance change, not a bookkeeping number.
+    """
+    w1 = brain.get_plastic_weights()
+    w0 = brain.w_init
+    with np.errstate(divide="ignore", invalid="ignore"):
+        factor = np.where(w0 > 0, w1 / np.maximum(w0, 1e-9), 1.0)
+    order = np.argsort(factor)
+    types = getattr(brain, "types", [])
+    def name(i):
+        return types[int(i)] if types and int(i) < len(types) else f"n{int(i)}"
+    changed = int((np.abs(factor - 1.0) > 0.01).sum())
+    print(f"plastic synapses changed >1%: {changed}/{len(w0)}", flush=True)
+    for tag, idx in (("strengthened", order[-top:][::-1]),
+                     ("weakened", order[:top])):
+        rows = []
+        for k in idx:
+            if abs(factor[int(k)] - 1.0) <= 0.01:
+                continue
+            ei = brain.plastic_idx[int(k)]
+            rows.append(f"{name(brain.edge_pre[ei])}->{name(brain.edge_post[ei])} "
+                        f"{w0[int(k)]:.0f}->{w1[int(k)]:.0f} (x{factor[int(k)]:.2f})")
+        if rows:
+            print(f"  {tag}: " + "; ".join(rows), flush=True)
 
 
 def main():
@@ -198,6 +246,9 @@ def main():
                     help="weight of dense loom (hazard) penalty in step reward")
     ap.add_argument("--imitate", type=float, default=0.0,
                     help="dense teacher bonus for matching expert wheels each step")
+    ap.add_argument("--novelty", type=float, default=0.0,
+                    help="curiosity weight: bonus 1/sqrt(visits) per sensor state. "
+                         "Explores; the task channel still defines right vs wrong.")
     ap.add_argument("--homeo-target", type=float, default=5.0,
                     help="homeostatic target rate (Hz-ish); 0 disables. Wakes "
                          "silent descending neurons so plasticity can reach them.")
@@ -254,15 +305,19 @@ def main():
     # validation always measures the TARGET task.
     best_fit, best_w, history = frozen_res["fitness"], None, []
     per_stage = max(1, args.episodes // len(stages))
+    novel = NoveltyBonus() if args.novelty > 0 else None
     for ep in range(args.episodes):
         stage_hn = stages[min(ep // per_stage, len(stages) - 1)]
         w = World(1, args.max_steps, seed=int(train_seeds[ep]),
                   heading_noise=stage_hn)
-        res, rbar = rollout_plastic(brain, w, gains, readout, args.max_steps,
-                                    train=True, crash_coef=args.crash_coef,
-                                    imitate_coef=args.imitate, eparams=eparams)
+        res, eret, parts = rollout_plastic(
+            brain, w, gains, readout, args.max_steps, train=True,
+            crash_coef=args.crash_coef, imitate_coef=args.imitate,
+            eparams=eparams, novelty=novel, novelty_coef=args.novelty)
         entry = {"episode": ep, "stage_hn": stage_hn,
-                 "fitness": res["fitness"], "rbar": rbar}
+                 "fitness": res["fitness"], "task": round(parts["task"], 3),
+                 "novelty": round(parts["novelty"], 3),
+                 "pam": round(parts["pam"], 3), "ppl": round(parts["ppl"], 3)}
         if (ep + 1) % args.val_every == 0 or ep == args.episodes - 1:
             v = rollout_split(brain, val, gains, readout, args.max_steps)
             entry.update(val_fitness=v["fitness"], val_success=v["success"])
@@ -271,7 +326,9 @@ def main():
                 best_w = brain.get_plastic_weights().copy()
                 entry["best"] = True
         history.append(entry)
-        msg = f"  train ep {ep + 1}/{args.episodes}: fitness={res['fitness']:.3f}"
+        msg = (f"  train ep {ep + 1}/{args.episodes}: fitness={res['fitness']:.3f} "
+               f"task={parts['task']:+.2f} nov={parts['novelty']:.1f} "
+               f"PAM={parts['pam']:.2f}/PPL={parts['ppl']:.2f}")
         if "val_fitness" in entry:
             msg += f" val={entry['val_fitness']:.3f}" + (" *BEST*" if entry.get("best") else "")
         print(msg, flush=True)
@@ -306,6 +363,10 @@ def main():
           f"fitness={tuned_res['fitness']:.3f}", flush=True)
     print(f"delta fitness: {tuned_res['fitness'] - frozen_res['fitness']:+.3f} "
           f"in {time.time() - t0:.0f}s", flush=True)
+    report_synapses(brain)
+    if novel is not None:
+        print(f"novelty coverage: {novel.coverage()} distinct sensor states",
+              flush=True)
 
     if args.out:
         mu, sd, W = readout
@@ -315,6 +376,7 @@ def main():
             "readout_kind": args.readout,
             "gain_odor": gains[0], "gain_loom": gains[1],
             "dagger_rounds": args.dagger, "crash_coef": args.crash_coef,
+            "imitate": args.imitate, "novelty": args.novelty,
             "homeo_target": args.homeo_target,
             "plastic_weights": brain.get_plastic_weights().tolist(),
             "readout": {"mu": mu.tolist(), "sd": sd.tolist(), "W": W.tolist()},
