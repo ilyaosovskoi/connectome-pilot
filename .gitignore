@@ -3,6 +3,8 @@
 data/*.parquet
 data/*.tsv
 data/*.part
+# Full-brain runtime NPZ (~300 MB, local experiment artifact).
+data/fly_full.npz
 
 # Local agent reports (session context, not for push).
 # See notes/HANDOFF.md.
