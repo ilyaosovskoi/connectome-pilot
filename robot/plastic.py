@@ -36,8 +36,9 @@ class PlasticFlyCircuit(FlyCircuit):
         decay: float = 0.9,
         w_min: float = 0.5,
         w_max: float = 30.0,
+        norm_power: float = 1.0,
     ):
-        super().__init__(path=path, dt=dt, edges=edges)
+        super().__init__(path=path, dt=dt, edges=edges, norm_power=norm_power)
         assert scope in ("dn-exc", "all-exc", "all")
         self.scope = scope
         self.lr = float(lr)
@@ -171,7 +172,7 @@ class PlasticFlyCircuit(FlyCircuit):
         np.add.at(in_sum, post_all, np.abs(raw_all))
         in_sum[in_sum == 0] = 1.0
         signed = raw_all * np.array([self.sign[p] for p in pre_all], dtype=np.float64)
-        normed = (signed / in_sum[post_all]).astype(np.float32)
+        normed = (signed / (in_sum[post_all] ** self.norm_power)).astype(np.float32)
         new_data = np.empty_like(data)
         for i in range(len(pre_all)):
             new_data[self._data_pos[i]] = normed[i]

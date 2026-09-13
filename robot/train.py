@@ -242,6 +242,8 @@ def main():
     ap.add_argument("--demo-rollouts", type=int, default=3)
     ap.add_argument("--dagger", type=int, default=1,
                     help="on-policy collect+label+refit rounds after plasticity")
+    ap.add_argument("--gains", type=str, default="10,20,40,80",
+                    help="comma-separated gain grid (used for odor x loom)")
     ap.add_argument("--crash-coef", type=float, default=0.5,
                     help="weight of dense loom (hazard) penalty in step reward")
     ap.add_argument("--imitate", type=float, default=0.0,
@@ -256,6 +258,9 @@ def main():
     ap.add_argument("--lr", type=float, default=0.1)
     ap.add_argument("--val-every", type=int, default=2)
     ap.add_argument("--readout", choices=("dn", "all"), default="dn")
+    ap.add_argument("--norm-power", type=float, default=1.0,
+                    help="drive normalization power: 1.0 linear fraction, "
+                         "0.5 sublinear (wakes hub neurons like DNa)")
     ap.add_argument("--heading-noise", type=float, default=np.pi,
                     help="target initial-heading noise (rad). With --curriculum, "
                          "ramps up to this value.")
@@ -286,7 +291,8 @@ def main():
     stream = list(demo_stream(probe, eparams, args.demo_rollouts))
     print(f"demos: {len(stream)} ticks x {probe.m} robots", flush=True)
 
-    brain = PlasticFlyCircuit(path=args.circuit, scope=args.scope, lr=args.lr)
+    brain = PlasticFlyCircuit(path=args.circuit, scope=args.scope, lr=args.lr,
+                              norm_power=args.norm_power)
     brain.set_readout(args.readout)
     if args.homeo_target > 0:
         brain.enable_homeostasis(target=args.homeo_target)
@@ -294,7 +300,9 @@ def main():
 
     # 2. Gain selection by closed-loop validation (NOT clone MSE).
     print("gain selection (closed-loop val):", flush=True)
-    gains, readout, mse, _ = select_gains(brain, stream, val, args.max_steps)
+    grid = tuple(float(x) for x in args.gains.split(",") if x.strip())
+    gains, readout, mse, _ = select_gains(brain, stream, val, args.max_steps,
+                                          grid=grid)
     frozen_res = rollout_split(brain, test, gains, readout, args.max_steps, reps=2)
     print(f"frozen baseline: success={frozen_res['success']:.0%} "
           f"crash={frozen_res['crash']:.0%} fitness={frozen_res['fitness']:.3f} "
@@ -377,6 +385,7 @@ def main():
             "gain_odor": gains[0], "gain_loom": gains[1],
             "dagger_rounds": args.dagger, "crash_coef": args.crash_coef,
             "imitate": args.imitate, "novelty": args.novelty,
+            "norm_power": args.norm_power,
             "homeo_target": args.homeo_target,
             "plastic_weights": brain.get_plastic_weights().tolist(),
             "readout": {"mu": mu.tolist(), "sd": sd.tolist(), "W": W.tolist()},

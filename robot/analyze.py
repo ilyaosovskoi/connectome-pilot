@@ -40,6 +40,9 @@ def main():
     ap.add_argument("--test-episodes", type=int, default=12)
     ap.add_argument("--max-steps", type=int, default=300)
     ap.add_argument("--readout", choices=("dn", "all"), default="all")
+    ap.add_argument("--norm-power", type=float, default=1.0,
+                    help="drive normalization power: 1.0 linear fraction, "
+                         "0.5 sublinear (wakes hub neurons like DNa)")
     ap.add_argument("--heading-noise", type=float, default=0.0,
                     help="uniform initial-heading noise (rad); pi = random heading")
     ap.add_argument("--seed", type=int, default=1)
@@ -58,7 +61,7 @@ def main():
     rows = []
     readouts = {}
     for g in GAINS:
-        c = FlyCircuit(args.circuit)
+        c = FlyCircuit(args.circuit, norm_power=args.norm_power)
         c.set_readout(args.readout)
         feats, targets = replay(c, stream, g)
         readout = fit_readout(feats, targets)
@@ -75,7 +78,7 @@ def main():
               f"{res['fitness']:>8.3f}", flush=True)
     # Clone MSE via fit_with_gain internals (recompute cheaply):
     from eval import fit_with_gain
-    c0 = FlyCircuit(args.circuit)
+    c0 = FlyCircuit(args.circuit, norm_power=args.norm_power)
     c0.set_readout(args.readout)
     best_gain, _, best_mse, _ = fit_with_gain(c0, stream)
     print(f"best clone gain: x{best_gain:g} (MSE {best_mse:.4f})")
@@ -86,13 +89,13 @@ def main():
     # 2. Modality ablation at best gain.
     g = best["gain"]
     readout = readouts[g]
-    base_c = FlyCircuit(args.circuit)
+    base_c = FlyCircuit(args.circuit, norm_power=args.norm_power)
     base_c.set_readout(args.readout)
     base = closed_loop(base_c, test_w, g, readout, args.max_steps)
     # NOTE: fresh circuit each time (rollout mutates state, reset inside anyway).
     results = {"full": {k: base[k] for k in ("success", "crash", "fitness")}}
     for knocked in ("odor", "loom"):
-        c = FlyCircuit(args.circuit)
+        c = FlyCircuit(args.circuit, norm_power=args.norm_power)
         c.set_readout(args.readout)
         # Zero the knocked group by emptying its index lists for this run.
         saved = {k: c.groups[k] for k in (f"{knocked}",) if knocked in c.groups}
@@ -108,7 +111,7 @@ def main():
 
     # 3. Top readout weights -> neuron types.
     mu, sd, W = readout
-    c = FlyCircuit(args.circuit)
+    c = FlyCircuit(args.circuit, norm_power=args.norm_power)
     c.set_readout(args.readout)
     feat_idx = c.feat_idx
     order = np.argsort(-np.abs(W).mean(axis=0)[:-1])[:5]

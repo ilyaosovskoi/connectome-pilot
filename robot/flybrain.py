@@ -46,12 +46,25 @@ I_SCALE = 25.0      # мВ на единицу нормированного си
 OUT_GROUPS = ("turn", "fwd", "bwd")   # единственный выход мозга к телу
 
 
+def normalized_matrix(n, pre, post, raw, sign, power: float = 1.0):
+    """Signed CSR drive matrix. power=1.0: drive = fraction of total input
+    (stable but drowns hub neurons with 10k+ inputs — verified: DNa never
+    fire). power=0.5: sublinear (dendrite-like) — strong paths survive."""
+    signed = np.asarray(raw, dtype=np.float64) * np.asarray(sign)[np.asarray(pre)].astype(np.float64)
+    in_sum = np.bincount(np.asarray(post), weights=np.abs(np.asarray(raw, dtype=np.float64)),
+                         minlength=n)
+    in_sum[in_sum == 0] = 1.0
+    vals = (signed / (in_sum[np.asarray(post)] ** power)).astype(np.float32)
+    return sp.csr_matrix((vals, (np.asarray(post), np.asarray(pre))), shape=(n, n))
+
+
 class FlyCircuit:
     """Контур + LIF. Умеет шагать батч роботов одновременно."""
 
-    def __init__(self, path: str = DEFAULT_CIRCUIT, dt: float = 5.0, edges=None):
+    def __init__(self, path: str = DEFAULT_CIRCUIT, dt: float = 5.0, edges=None,
+                 norm_power: float = 1.0):
         if path is not None and str(path).endswith(".npz"):
-            self._init_from_npz(str(path), dt)
+            self._init_from_npz(str(path), dt, norm_power)
             return
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
@@ -82,31 +95,24 @@ class FlyCircuit:
         self.out_idx = np.concatenate([self.groups[g] for g in OUT_GROUPS if g in self.groups]) \
             if any(g in self.groups for g in OUT_GROUPS) else np.array([], dtype=np.int32)
         self.set_readout("dn")
+        self.norm_power = float(norm_power)
 
-        # Нормировка на полный синаптический вход постсинаптической клетки:
-        # тогда "драйв" — доля её входа, а не абсолютное число синапсов.
-        in_sum = np.bincount(post, weights=np.abs(w), minlength=self.n).astype(np.float32)
-        in_sum[in_sum == 0] = 1.0
-        B = sp.coo_matrix((signed / in_sum[post], (post, pre)), shape=(self.n, self.n)).tocsr()
-        B.sum_duplicates()
-        self.B = B
+        # Synaptic drive matrix (see normalized_matrix for power semantics).
+        self.B = normalized_matrix(self.n, pre, post, w, self.sign, norm_power)
 
         self.reset(batch=1)
 
-    def _init_from_npz(self, path: str, dt: float) -> None:
+    def _init_from_npz(self, path: str, dt: float, norm_power: float = 1.0) -> None:
         """Load a pre-converted NPZ bundle (see robot/formats.py --emit).
 
-        Same synapses, signs and normalization as the JSON edge-list,
-        but faster to load and smaller on disk.
+        Same synapses and signs as the JSON edge-list, faster to load and
+        smaller on disk. Normalization is rebuilt here so norm_power applies
+        equally to both formats (stored CSR values are ignored).
         """
         z = np.load(path, allow_pickle=True)
-        csr = sp.csr_matrix(
-            (np.asarray(z["data"], dtype=np.float32),
-             np.asarray(z["indices"], dtype=np.int32),
-             np.asarray(z["indptr"], dtype=np.int32)))
-        self.n = int(csr.shape[0])
+        self.norm_power = float(norm_power)
+        self.n = int(z["indptr"].size - 1)
         self.dt = float(dt)
-        self.B = csr
         self.meta = json.loads(str(z["meta_json"][0])) if "meta_json" in z else {}
         self.sign = np.asarray(z["sign"], dtype=np.float32)
         self.side = np.asarray(z["side"], dtype=np.int8)
@@ -119,6 +125,11 @@ class FlyCircuit:
         self.out_idx = np.concatenate([self.groups[g] for g in OUT_GROUPS if g in self.groups]) \
             if any(g in self.groups for g in OUT_GROUPS) else np.array([], dtype=np.int32)
         self.set_readout("dn")
+        # Rebuild the drive matrix from raw counts so norm_power applies.
+        self.B = normalized_matrix(
+            self.n, np.asarray(z["pre"]), np.asarray(z["post"]),
+            np.asarray(z["raw"], dtype=np.float32),
+            np.asarray(z["sign"]), self.norm_power)
         self.reset(batch=1)
 
     # ── состояние ──

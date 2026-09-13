@@ -34,7 +34,8 @@ def load_brain(args):
         circuit_path = os.path.join(ROOT, "data", ck.get("circuit", "fly_circuit_256.npz"))
         if not os.path.exists(circuit_path):
             circuit_path = args.circuit
-        brain = PlasticFlyCircuit(path=circuit_path, scope=ck.get("scope", "dn-exc"))
+        brain = PlasticFlyCircuit(path=circuit_path, scope=ck.get("scope", "dn-exc"),
+                                  norm_power=float(ck.get("norm_power", 1.0)))
         brain.set_readout(ck.get("readout_kind", "all"))
         brain.set_plastic_weights(np.asarray(ck["plastic_weights"], dtype=np.float64))
         if ck.get("homeo_target", 0) > 0:
@@ -50,7 +51,7 @@ def load_brain(args):
               f"(circuit {os.path.basename(circuit_path)}, "
               f"odor x{gains[0]:g} loom x{gains[1]:g})")
         return brain, gains, readout
-    brain = FlyCircuit(args.circuit)
+    brain = FlyCircuit(args.circuit, norm_power=args.norm_power)
     brain.set_readout(args.readout)
     probe = World(8, args.max_steps, seed=100 + args.seed)
     eparams, _ = tune_expert(probe)
@@ -129,6 +130,7 @@ def main():
     ap.add_argument("--episodes", type=int, default=10)
     ap.add_argument("--max-steps", type=int, default=400)
     ap.add_argument("--readout", choices=("dn", "all"), default="all")
+    ap.add_argument("--norm-power", type=float, default=1.0)
     ap.add_argument("--fit-body", action="store_true",
                     help="fit a separate readout per body from its own expert "
                          "(vs zero-shot transfer of the rover readout)")
