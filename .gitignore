@@ -1,0 +1,9 @@
+# Полный коннектом FlyWire — качается скриптом, в git не нужен (~127 МБ).
+# python3 scripts/download_full.py
+data/*.parquet
+data/*.tsv
+data/*.part
+
+.DS_Store
+__pycache__/
+*.pyc
